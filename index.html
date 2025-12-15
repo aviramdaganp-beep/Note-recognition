@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="he">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>iPhone Pitch Detector</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 0; padding: 18px; }
+    button { width: 100%; padding: 16px; font-size: 20px; border: 0; border-radius: 14px; font-weight: 800; }
+    .card { margin-top: 14px; padding: 16px; border: 1px solid #e6e6e6; border-radius: 14px; }
+    .note { font-size: 48px; font-weight: 900; }
+    .muted { color: #666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .row { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0 0 6px 0;">זיהוי צליל (אייפון)</h2>
+  <div class="muted">פתח ב-Safari דרך HTTPS. לחץ “התחל”.</div>
+
+  <button id="btn">🎤 התחל</button>
+
+  <div class="card">
+    <div class="note" id="note">—</div>
+    <div class="row">Hz: <span class="mono" id="freq">—</span></div>
+    <div class="row">Cents: <span class="mono" id="cents">—</span></div>
+    <div class="row">Clarity: <span class="mono" id="clarity">—</span></div>
+    <div class="row muted">Status: <span class="mono" id="status">לא פעיל</span></div>
+  </div>
+
+  <!-- iOS hint -->
+  <audio playsinline></audio>
+
+<script>
+(() => {
+  const btn = document.getElementById("btn");
+  const noteEl = document.getElementById("note");
+  const freqEl = document.getElementById("freq");
+  const centsEl = document.getElementById("cents");
+  const clarityEl = document.getElementById("clarity");
+  const statusEl = document.getElementById("status");
+
+  const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const bufferSize = 2048;
+  const buf = new Float32Array(bufferSize);
+
+  let audioCtx, analyser, stream, rafId;
+  let running = false;
+
+  btn.addEventListener("click", async () => {
+    if (running) return stop();
+
+    try {
+      if (!window.isSecureContext) {
+        statusEl.textContent = "צריך HTTPS (לא עובד מ-file://).";
+        return;
+      }
+
+      statusEl.textContent = "מבקש גישה למיקרופון…";
+
+      // Keep constraints minimal on iOS to avoid weird processing
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = bufferSize;
+      analyser.smoothingTimeConstant = 0.15;
+      source.connect(analyser);
+
+      running = true;
+      btn.textContent = "⏹ עצור";
+      statusEl.textContent = "מאזין…";
+      loop();
+    } catch (e) {
+      statusEl.textContent = "שגיאה: " + (e?.message || e);
+    }
+  });
+
+  function loop() {
+    analyser.getFloatTimeDomainData(buf);
+    const { freq, clarity } = detectPitchAutocorr(buf, audioCtx.sampleRate);
+
+    clarityEl.textContent = clarity ? clarity.toFixed(2) : "—";
+
+    // iPhone: be stricter to reduce flicker
+    if (freq && clarity > 0.70) {
+      const midi = freqToMidi(freq);
+      const name = midiToNoteName(midi);
+      const ref = midiToFreq(midi);
+      const cents = centsOff(freq, ref);
+
+      noteEl.textContent = name;
+      freqEl.textContent = freq.toFixed(2);
+      centsEl.textContent = (cents >= 0 ? "+" : "") + cents.toFixed(1);
+    } else {
+      noteEl.textContent = "—";
+      freqEl.textContent = "—";
+      centsEl.textContent = "—";
+    }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function stop() {
+    running = false;
+    btn.textContent = "🎤 התחל";
+    statusEl.textContent = "לא פעיל";
+
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+
+    if (audioCtx) audioCtx.close();
+    audioCtx = null;
+
+    noteEl.textContent = "—";
+    freqEl.textContent = "—";
+    centsEl.textContent = "—";
+    clarityEl.textContent = "—";
+  }
+
+  // --- autocorrelation pitch detect ---
+  function detectPitchAutocorr(signal, sampleRate) {
+    let mean = 0;
+    for (let i = 0; i < signal.length; i++) mean += signal[i];
+    mean /= signal.length;
+
+    let rms = 0;
+    for (let i = 0; i < signal.length; i++) {
+      const v = signal[i] - mean;
+      rms += v * v;
+    }
+    rms = Math.sqrt(rms / signal.length);
+    if (rms < 0.01) return { freq: null, clarity: 0 };
+
+    const n = signal.length;
+    const corr = new Float32Array(n);
+
+    for (let lag = 0; lag < n; lag++) {
+      let sum = 0;
+      for (let i = 0; i < n - lag; i++) {
+        const a = signal[i] - mean;
+        const b = signal[i + lag] - mean;
+        sum += a * b;
+      }
+      corr[lag] = sum;
+    }
+
+    let d = 0;
+    while (d < n - 1 && corr[d + 1] > corr[d]) d++;
+
+    let maxLag = -1, maxVal = -Infinity;
+    for (let lag = d; lag < n; lag++) {
+      if (corr[lag] > maxVal) { maxVal = corr[lag]; maxLag = lag; }
+    }
+    if (maxLag <= 0) return { freq: null, clarity: 0 };
+
+    const refinedLag = parabolicPeak(corr, maxLag);
+    const freq = sampleRate / refinedLag;
+
+    const clarity = maxVal / (corr[0] || 1);
+
+    if (freq < 50 || freq > 2000) return { freq: null, clarity: 0 };
+    return { freq, clarity: clamp01(clarity) };
+  }
+
+  function parabolicPeak(arr, i) {
+    const i0 = i > 0 ? i - 1 : i;
+    const i2 = i < arr.length - 1 ? i + 1 : i;
+    if (i0 === i || i2 === i) return i;
+
+    const y0 = arr[i0], y1 = arr[i], y2 = arr[i2];
+    const denom = (y0 - 2*y1 + y2);
+    if (denom === 0) return i;
+
+    const delta = 0.5 * (y0 - y2) / denom;
+    return i + delta;
+  }
+
+  function freqToMidi(f) { return Math.round(69 + 12 * Math.log2(f / 440)); }
+  function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+  function midiToNoteName(m) {
+    const name = NOTE_NAMES[(m % 12 + 12) % 12];
+    const octave = Math.floor(m / 12) - 1;
+    return `${name}${octave}`;
+  }
+  function centsOff(f, ref) { return 1200 * Math.log2(f / ref); }
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+  window.addEventListener("pagehide", stop);
+})();
+</script>
+</body>
+</html>
