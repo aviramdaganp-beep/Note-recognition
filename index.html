@@ -166,33 +166,57 @@
   // --- Pitch detection via autocorrelation ---
   // Returns: {freq, clarity, rms}
   function detectPitchAutocorr(signal, sampleRate) {
-    // Remove DC
-    let mean = 0;
-    for (let i = 0; i < signal.length; i++) mean += signal[i];
-    mean /= signal.length;
+  // Remove DC
+  let mean = 0;
+  for (let i = 0; i < signal.length; i++) mean += signal[i];
+  mean /= signal.length;
 
-    // RMS
-    let rms = 0;
-    for (let i = 0; i < signal.length; i++) {
-      const v = signal[i] - mean;
-      rms += v * v;
+  // RMS
+  let rms = 0;
+  for (let i = 0; i < signal.length; i++) {
+    const v = signal[i] - mean;
+    rms += v * v;
+  }
+  rms = Math.sqrt(rms / signal.length);
+  if (rms < RMS_GATE) return { freq: null, clarity: 0, rms };
+
+  const n = signal.length;
+  const corr = new Float32Array(n);
+
+  for (let lag = 0; lag < n; lag++) {
+    let sum = 0;
+    for (let i = 0; i < n - lag; i++) {
+      const a = signal[i] - mean;
+      const b = signal[i + lag] - mean;
+      sum += a * b;
     }
-    rms = Math.sqrt(rms / signal.length);
+    corr[lag] = sum;
+  }
 
-    if (rms < RMS_GATE) return { freq: null, clarity: 0, rms };
+  // Important: NEVER pick lag=0 as the peak.
+  // Find the first "valley" after the initial drop, then search for a peak after it.
+  let lag = 1;
+  while (lag < n - 1 && corr[lag] > corr[lag + 1]) lag++; // descend to valley
 
-    const n = signal.length;
-    const corr = new Float32Array(n);
-
-    for (let lag = 0; lag < n; lag++) {
-      let sum = 0;
-      for (let i = 0; i < n - lag; i++) {
-        const a = signal[i] - mean;
-        const b = signal[i + lag] - mean;
-        sum += a * b;
-      }
-      corr[lag] = sum;
+  let maxLag = -1;
+  let maxVal = -Infinity;
+  for (let l = lag; l < n; l++) {
+    if (corr[l] > maxVal) {
+      maxVal = corr[l];
+      maxLag = l;
     }
+  }
+  if (maxLag <= 0) return { freq: null, clarity: 0, rms };
+
+  const refinedLag = parabolicPeak(corr, maxLag);
+  const freq = sampleRate / refinedLag;
+
+  // clarity: peak relative to lag0 energy
+  const clarity = clamp01(maxVal / (corr[0] || 1));
+
+  if (freq < 50 || freq > 2000) return { freq: null, clarity: 0, rms };
+  return { freq, clarity, rms };
+}
 
     // find where correlation starts descending then later peaks
     let d = 0;
