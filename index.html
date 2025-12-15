@@ -8,15 +8,16 @@
     body { font-family: system-ui, Arial; margin: 0; padding: 18px; }
     button { width: 100%; padding: 16px; font-size: 20px; border: 0; border-radius: 14px; font-weight: 800; }
     .card { margin-top: 14px; padding: 16px; border: 1px solid #e6e6e6; border-radius: 14px; }
-    .note { font-size: 48px; font-weight: 900; }
+    .note { font-size: 52px; font-weight: 900; line-height: 1.1; }
     .muted { color: #666; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .row { margin-top: 10px; }
+    .hint { margin-top: 10px; font-size: 14px; color: #666; }
   </style>
 </head>
 <body>
-  <h2 style="margin:0 0 6px 0;">זיהוי צליל (אייפון)</h2>
-  <div class="muted">פתח ב-Safari דרך HTTPS. לחץ “התחל”.</div>
+  <h2 style="margin:0 0 6px 0;">זיהוי צליל מהמיקרופון (אייפון)</h2>
+  <div class="muted">חייב HTTPS. עדיף לפתוח ב-Safari. לחץ “התחל”.</div>
 
   <button id="btn">🎤 התחל</button>
 
@@ -24,8 +25,12 @@
     <div class="note" id="note">—</div>
     <div class="row">Hz: <span class="mono" id="freq">—</span></div>
     <div class="row">Cents: <span class="mono" id="cents">—</span></div>
+
     <div class="row">Clarity: <span class="mono" id="clarity">—</span></div>
+    <div class="row">RMS: <span class="mono" id="rms">—</span></div>
+
     <div class="row muted">Status: <span class="mono" id="status">לא פעיל</span></div>
+    <div class="hint">טיפ: תו בודד ויציב (שריקה / “אהה” / פסנתר תו יחיד). מוזיקה/אקורדים יקפיצו.</div>
   </div>
 
   <!-- iOS hint -->
@@ -38,14 +43,29 @@
   const freqEl = document.getElementById("freq");
   const centsEl = document.getElementById("cents");
   const clarityEl = document.getElementById("clarity");
+  const rmsEl = document.getElementById("rms");
   const statusEl = document.getElementById("status");
 
   const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
-  const bufferSize = 2048;
-  const buf = new Float32Array(bufferSize);
 
-  let audioCtx, analyser, stream, rafId;
+  // iOS: 2048/4096 עובד, 2048 יותר מהיר. אם יש אי-יציבות בקול נמוך, נסה 4096.
+  const FFT_SIZE = 2048;
+  const buf = new Float32Array(FFT_SIZE);
+
+  let audioCtx = null;
+  let analyser = null;
+  let stream = null;
+  let rafId = null;
   let running = false;
+
+  // smoothing for displayed frequency (to reduce flicker)
+  let smoothedFreq = null;
+  const SMOOTH_ALPHA = 0.25; // higher = smoother
+
+  // thresholds
+  const RMS_GATE = 0.005;     // ignore near-silence
+  const CLARITY_GATE = 0.45;  // be forgiving on iOS
+  const MAX_JUMP_RATIO = 1.25; // ignore sudden >25% jumps (often glitches)
 
   btn.addEventListener("click", async () => {
     if (running) return stop();
@@ -58,47 +78,62 @@
 
       statusEl.textContent = "מבקש גישה למיקרופון…";
 
-      // Keep constraints minimal on iOS to avoid weird processing
+      // Keep it minimal on iOS (advanced constraints can break pitch)
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       if (audioCtx.state === "suspended") await audioCtx.resume();
 
-      const source = audioCtx.createMediaStreamSource(stream);
+      const src = audioCtx.createMediaStreamSource(stream);
+
       analyser = audioCtx.createAnalyser();
-      analyser.fftSize = bufferSize;
-      analyser.smoothingTimeConstant = 0.15;
-      source.connect(analyser);
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0.15; // small smoothing
+
+      src.connect(analyser);
 
       running = true;
       btn.textContent = "⏹ עצור";
       statusEl.textContent = "מאזין…";
       loop();
     } catch (e) {
-      statusEl.textContent = "שגיאה: " + (e?.message || e);
+      statusEl.textContent = "שגיאה: " + (e?.name ? `${e.name}: ` : "") + (e?.message || e);
     }
   });
 
   function loop() {
     analyser.getFloatTimeDomainData(buf);
-    const { freq, clarity } = detectPitchAutocorr(buf, audioCtx.sampleRate);
 
-    clarityEl.textContent = clarity ? clarity.toFixed(2) : "—";
+    const res = detectPitchAutocorr(buf, audioCtx.sampleRate);
+    const freq = res.freq;
+    const clarity = res.clarity;
+    const rms = res.rms;
 
-    // iPhone: be stricter to reduce flicker
-    if (freq && clarity > 0.70) {
-      const midi = freqToMidi(freq);
-      const name = midiToNoteName(midi);
-      const ref = midiToFreq(midi);
-      const cents = centsOff(freq, ref);
+    rmsEl.textContent = rms.toFixed(4);
+    clarityEl.textContent = clarity.toFixed(2);
 
-      noteEl.textContent = name;
-      freqEl.textContent = freq.toFixed(2);
-      centsEl.textContent = (cents >= 0 ? "+" : "") + cents.toFixed(1);
+    if (freq && rms >= RMS_GATE && clarity >= CLARITY_GATE) {
+      // Reject crazy jumps (often false detections)
+      if (smoothedFreq && (freq / smoothedFreq > MAX_JUMP_RATIO || smoothedFreq / freq > MAX_JUMP_RATIO)) {
+        // ignore this frame
+      } else {
+        smoothedFreq = smoothedFreq == null ? freq : (smoothedFreq * (1 - SMOOTH_ALPHA) + freq * SMOOTH_ALPHA);
+
+        const midi = freqToMidi(smoothedFreq);
+        const name = midiToNoteName(midi);
+        const ref = midiToFreq(midi);
+        const cents = centsOff(smoothedFreq, ref);
+
+        noteEl.textContent = name;
+        freqEl.textContent = smoothedFreq.toFixed(2);
+        centsEl.textContent = (cents >= 0 ? "+" : "") + cents.toFixed(1);
+      }
     } else {
+      // keep RMS/clarity shown, but clear note if too unstable
       noteEl.textContent = "—";
       freqEl.textContent = "—";
       centsEl.textContent = "—";
+      smoothedFreq = null;
     }
 
     rafId = requestAnimationFrame(loop);
@@ -118,25 +153,33 @@
     if (audioCtx) audioCtx.close();
     audioCtx = null;
 
+    analyser = null;
+    smoothedFreq = null;
+
     noteEl.textContent = "—";
     freqEl.textContent = "—";
     centsEl.textContent = "—";
     clarityEl.textContent = "—";
+    rmsEl.textContent = "—";
   }
 
-  // --- autocorrelation pitch detect ---
+  // --- Pitch detection via autocorrelation ---
+  // Returns: {freq, clarity, rms}
   function detectPitchAutocorr(signal, sampleRate) {
+    // Remove DC
     let mean = 0;
     for (let i = 0; i < signal.length; i++) mean += signal[i];
     mean /= signal.length;
 
+    // RMS
     let rms = 0;
     for (let i = 0; i < signal.length; i++) {
       const v = signal[i] - mean;
       rms += v * v;
     }
     rms = Math.sqrt(rms / signal.length);
-    if (rms < 0.01) return { freq: null, clarity: 0 };
+
+    if (rms < RMS_GATE) return { freq: null, clarity: 0, rms };
 
     const n = signal.length;
     const corr = new Float32Array(n);
@@ -151,22 +194,28 @@
       corr[lag] = sum;
     }
 
+    // find where correlation starts descending then later peaks
     let d = 0;
     while (d < n - 1 && corr[d + 1] > corr[d]) d++;
 
-    let maxLag = -1, maxVal = -Infinity;
+    let maxLag = -1;
+    let maxVal = -Infinity;
     for (let lag = d; lag < n; lag++) {
       if (corr[lag] > maxVal) { maxVal = corr[lag]; maxLag = lag; }
     }
-    if (maxLag <= 0) return { freq: null, clarity: 0 };
+
+    if (maxLag <= 0) return { freq: null, clarity: 0, rms };
 
     const refinedLag = parabolicPeak(corr, maxLag);
     const freq = sampleRate / refinedLag;
 
-    const clarity = maxVal / (corr[0] || 1);
+    // clarity ~ peak relative to lag0 energy
+    const clarity = clamp01(maxVal / (corr[0] || 1));
 
-    if (freq < 50 || freq > 2000) return { freq: null, clarity: 0 };
-    return { freq, clarity: clamp01(clarity) };
+    // Typical range for voice/instruments; tweak if needed
+    if (freq < 50 || freq > 2000) return { freq: null, clarity: 0, rms };
+
+    return { freq, clarity, rms };
   }
 
   function parabolicPeak(arr, i) {
@@ -182,11 +231,12 @@
     return i + delta;
   }
 
+  // --- Note helpers ---
   function freqToMidi(f) { return Math.round(69 + 12 * Math.log2(f / 440)); }
   function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
   function midiToNoteName(m) {
     const name = NOTE_NAMES[(m % 12 + 12) % 12];
-    const octave = Math.floor(m / 12) - 1;
+    const octave = Math.floor(m / 12) - 1; // MIDI 60 = C4
     return `${name}${octave}`;
   }
   function centsOff(f, ref) { return 1200 * Math.log2(f / ref); }
