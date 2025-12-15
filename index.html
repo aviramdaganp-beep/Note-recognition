@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>iPhone Pitch Detector</title>
+  <title>iPhone Pitch Detector (YIN)</title>
   <style>
     body { font-family: system-ui, Arial; margin: 0; padding: 18px; }
     button { width: 100%; padding: 16px; font-size: 20px; border: 0; border-radius: 14px; font-weight: 800; }
@@ -13,9 +13,12 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .row { margin-top: 10px; }
     .hint { margin-top: 10px; font-size: 14px; color: #666; }
+    .ver { margin: 6px 0 10px; color: #b00000; font-weight: 900; }
   </style>
 </head>
 <body>
+  <div class="ver">VERSION YIN 1</div>
+
   <h2 style="margin:0 0 6px 0;">זיהוי צליל מהמיקרופון (אייפון)</h2>
   <div class="muted">חייב HTTPS. עדיף לפתוח ב-Safari. לחץ “התחל”.</div>
 
@@ -23,14 +26,15 @@
 
   <div class="card">
     <div class="note" id="note">—</div>
+
     <div class="row">Hz: <span class="mono" id="freq">—</span></div>
     <div class="row">Cents: <span class="mono" id="cents">—</span></div>
 
-    <div class="row">Clarity: <span class="mono" id="clarity">—</span></div>
+    <div class="row">Clarity (prob): <span class="mono" id="clarity">—</span></div>
     <div class="row">RMS: <span class="mono" id="rms">—</span></div>
 
     <div class="row muted">Status: <span class="mono" id="status">לא פעיל</span></div>
-    <div class="hint">טיפ: תו בודד ויציב (שריקה / “אהה” / פסנתר תו יחיד). מוזיקה/אקורדים יקפיצו.</div>
+    <div class="hint">טיפ: תו בודד ויציב (שריקה / “אוּ” / פסנתר תו אחד). מוזיקה/אקורדים יקפיצו.</div>
   </div>
 
   <!-- iOS hint -->
@@ -48,9 +52,15 @@
 
   const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 
-  // iOS: 2048/4096 עובד, 2048 יותר מהיר. אם יש אי-יציבות בקול נמוך, נסה 4096.
-  const FFT_SIZE = 2048;
+  const FFT_SIZE = 2048;              // try 4096 if you want better low-note stability
   const buf = new Float32Array(FFT_SIZE);
+
+  // Gates
+  const RMS_GATE = 0.005;             // silence gate
+  const YIN_THRESHOLD = 0.12;         // higher = more sensitive, lower = stricter
+  const YIN_PROB_GATE = 0.55;         // show note only above this
+  const MAX_JUMP_RATIO = 2.0;         // ignore insane jumps
+  const SMOOTH_ALPHA = 0.25;          // display smoothing
 
   let audioCtx = null;
   let analyser = null;
@@ -58,14 +68,7 @@
   let rafId = null;
   let running = false;
 
-  // smoothing for displayed frequency (to reduce flicker)
   let smoothedFreq = null;
-  const SMOOTH_ALPHA = 0.25; // higher = smoother
-
-  // thresholds
-  const RMS_GATE = 0.005;     // ignore near-silence
-  const CLARITY_GATE = 0.25;  // be forgiving on iOS
-  const MAX_JUMP_RATIO = 2.0; // ignore sudden >25% jumps (often glitches)
 
   btn.addEventListener("click", async () => {
     if (running) return stop();
@@ -78,7 +81,7 @@
 
       statusEl.textContent = "מבקש גישה למיקרופון…";
 
-      // Keep it minimal on iOS (advanced constraints can break pitch)
+      // iOS: keep constraints minimal
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -88,7 +91,7 @@
 
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = FFT_SIZE;
-      analyser.smoothingTimeConstant = 0.15; // small smoothing
+      analyser.smoothingTimeConstant = 0.15;
 
       src.connect(analyser);
 
@@ -104,16 +107,16 @@
   function loop() {
     analyser.getFloatTimeDomainData(buf);
 
-    const res = detectPitchAutocorr(buf, audioCtx.sampleRate);
+    const res = detectPitchYIN(buf, audioCtx.sampleRate);
     const freq = res.freq;
-    const clarity = res.clarity;
+    const prob = res.prob;
     const rms = res.rms;
 
     rmsEl.textContent = rms.toFixed(4);
-    clarityEl.textContent = clarity.toFixed(2);
+    clarityEl.textContent = prob.toFixed(2);
 
-    if (freq && rms >= RMS_GATE && clarity >= CLARITY_GATE) {
-      // Reject crazy jumps (often false detections)
+    if (freq && rms >= RMS_GATE && prob >= YIN_PROB_GATE) {
+      // reject crazy jumps
       if (smoothedFreq && (freq / smoothedFreq > MAX_JUMP_RATIO || smoothedFreq / freq > MAX_JUMP_RATIO)) {
         // ignore this frame
       } else {
@@ -129,7 +132,6 @@
         centsEl.textContent = (cents >= 0 ? "+" : "") + cents.toFixed(1);
       }
     } else {
-      // keep RMS/clarity shown, but clear note if too unstable
       noteEl.textContent = "—";
       freqEl.textContent = "—";
       centsEl.textContent = "—";
@@ -163,104 +165,91 @@
     rmsEl.textContent = "—";
   }
 
-  // --- Pitch detection via autocorrelation ---
-  // Returns: {freq, clarity, rms}
-  function detectPitchAutocorr(signal, sampleRate) {
-  // Remove DC
-  let mean = 0;
-  for (let i = 0; i < signal.length; i++) mean += signal[i];
-  mean /= signal.length;
+  // -----------------------
+  // YIN pitch detection
+  // Returns: { freq, prob, rms }
+  // -----------------------
+  function detectPitchYIN(signal, sampleRate) {
+    // DC removal + RMS
+    let mean = 0;
+    for (let i = 0; i < signal.length; i++) mean += signal[i];
+    mean /= signal.length;
 
-  // RMS
-  let rms = 0;
-  for (let i = 0; i < signal.length; i++) {
-    const v = signal[i] - mean;
-    rms += v * v;
-  }
-  rms = Math.sqrt(rms / signal.length);
-  if (rms < RMS_GATE) return { freq: null, clarity: 0, rms };
-
-  const n = signal.length;
-  const corr = new Float32Array(n);
-
-  for (let lag = 0; lag < n; lag++) {
-    let sum = 0;
-    for (let i = 0; i < n - lag; i++) {
-      const a = signal[i] - mean;
-      const b = signal[i + lag] - mean;
-      sum += a * b;
+    const x = new Float32Array(signal.length);
+    let rms = 0;
+    for (let i = 0; i < signal.length; i++) {
+      const v = signal[i] - mean;
+      x[i] = v;
+      rms += v * v;
     }
-    corr[lag] = sum;
-  }
+    rms = Math.sqrt(rms / signal.length);
+    if (rms < RMS_GATE) return { freq: null, prob: 0, rms };
 
-  // Important: NEVER pick lag=0 as the peak.
-  // Find the first "valley" after the initial drop, then search for a peak after it.
-  let lag = 1;
-  while (lag < n - 1 && corr[lag] > corr[lag + 1]) lag++; // descend to valley
+    const n = x.length;
+    const maxTau = Math.floor(n / 2);
 
-  let maxLag = -1;
-  let maxVal = -Infinity;
-  for (let l = lag; l < n; l++) {
-    if (corr[l] > maxVal) {
-      maxVal = corr[l];
-      maxLag = l;
-    }
-  }
-  if (maxLag <= 0) return { freq: null, clarity: 0, rms };
-
-  const refinedLag = parabolicPeak(corr, maxLag);
-  const freq = sampleRate / refinedLag;
-
-  // clarity: peak relative to lag0 energy
-  const clarity = clamp01(maxVal / (corr[0] || 1));
-
-  if (freq < 50 || freq > 2000) return { freq: null, clarity: 0, rms };
-  return { freq, clarity, rms };
-}
-
-    // find where correlation starts descending then later peaks
-    let d = 0;
-    while (d < n - 1 && corr[d + 1] > corr[d]) d++;
-
-    let maxLag = -1;
-    let maxVal = -Infinity;
-    for (let lag = d; lag < n; lag++) {
-      if (corr[lag] > maxVal) { maxVal = corr[lag]; maxLag = lag; }
+    // difference function
+    const d = new Float32Array(maxTau);
+    for (let tau = 1; tau < maxTau; tau++) {
+      let sum = 0;
+      for (let i = 0; i < maxTau; i++) {
+        const delta = x[i] - x[i + tau];
+        sum += delta * delta;
+      }
+      d[tau] = sum;
     }
 
-    if (maxLag <= 0) return { freq: null, clarity: 0, rms };
+    // CMNDF
+    const cmndf = new Float32Array(maxTau);
+    cmndf[0] = 1;
+    let runningSum = 0;
+    for (let tau = 1; tau < maxTau; tau++) {
+      runningSum += d[tau];
+      cmndf[tau] = d[tau] * tau / (runningSum || 1e-12);
+    }
 
-    const refinedLag = parabolicPeak(corr, maxLag);
-    const freq = sampleRate / refinedLag;
+    // absolute threshold
+    let tauEstimate = -1;
+    for (let tau = 2; tau < maxTau; tau++) {
+      if (cmndf[tau] < YIN_THRESHOLD) {
+        while (tau + 1 < maxTau && cmndf[tau + 1] < cmndf[tau]) tau++;
+        tauEstimate = tau;
+        break;
+      }
+    }
+    if (tauEstimate === -1) return { freq: null, prob: 0, rms };
 
-    // clarity ~ peak relative to lag0 energy
-    const clarity = clamp01(maxVal / (corr[0] || 1));
+    const betterTau = parabolicTau(cmndf, tauEstimate);
+    const freq = sampleRate / betterTau;
 
-    // Typical range for voice/instruments; tweak if needed
-    if (freq < 50 || freq > 2000) return { freq: null, clarity: 0, rms };
+    // probability of periodicity (1 = very periodic)
+    const prob = clamp01(1 - cmndf[tauEstimate]);
 
-    return { freq, clarity, rms };
+    if (freq < 50 || freq > 2000) return { freq: null, prob: 0, rms };
+    return { freq, prob, rms };
   }
 
-  function parabolicPeak(arr, i) {
-    const i0 = i > 0 ? i - 1 : i;
-    const i2 = i < arr.length - 1 ? i + 1 : i;
-    if (i0 === i || i2 === i) return i;
+  function parabolicTau(arr, tau) {
+    const x0 = tau > 1 ? tau - 1 : tau;
+    const x2 = tau + 1 < arr.length ? tau + 1 : tau;
+    if (x0 === tau || x2 === tau) return tau;
 
-    const y0 = arr[i0], y1 = arr[i], y2 = arr[i2];
-    const denom = (y0 - 2*y1 + y2);
-    if (denom === 0) return i;
+    const s0 = arr[x0], s1 = arr[tau], s2 = arr[x2];
+    const denom = (s0 - 2 * s1 + s2);
+    if (denom === 0) return tau;
 
-    const delta = 0.5 * (y0 - y2) / denom;
-    return i + delta;
+    const delta = 0.5 * (s0 - s2) / denom;
+    return tau + delta;
   }
 
-  // --- Note helpers ---
+  // -----------------------
+  // Note helpers
+  // -----------------------
   function freqToMidi(f) { return Math.round(69 + 12 * Math.log2(f / 440)); }
   function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
   function midiToNoteName(m) {
     const name = NOTE_NAMES[(m % 12 + 12) % 12];
-    const octave = Math.floor(m / 12) - 1; // MIDI 60 = C4
+    const octave = Math.floor(m / 12) - 1;
     return `${name}${octave}`;
   }
   function centsOff(f, ref) { return 1200 * Math.log2(f / ref); }
