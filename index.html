@@ -64,8 +64,8 @@
 
   // thresholds
   const RMS_GATE = 0.005;     // ignore near-silence
-  const CLARITY_GATE = 0.45;  // be forgiving on iOS
-  const MAX_JUMP_RATIO = 1.25; // ignore sudden >25% jumps (often glitches)
+  const CLARITY_GATE = 0.25;  // be forgiving on iOS
+  const MAX_JUMP_RATIO = 2.0; // ignore sudden >25% jumps (often glitches)
 
   btn.addEventListener("click", async () => {
     if (running) return stop();
